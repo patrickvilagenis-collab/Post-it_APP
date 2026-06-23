@@ -12,5 +12,5 @@
 // Si dejas estos valores vacíos, la app funciona en MODO LOCAL: guarda solo
 // en este navegador (localStorage), sin sincronización entre dispositivos.
 // ─────────────────────────────────────────────────────────────────────────
-window.SUPABASE_URL = "";
-window.SUPABASE_ANON_KEY = "";
+window.SUPABASE_URL = "https://oatudfzftpvyofygbsql.supabase.co";
+window.SUPABASE_ANON_KEY = "sb_publishable_7XjfqNN71jGLQb_8wI23_w_XXAy2qjt";
