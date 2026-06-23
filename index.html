@@ -34,11 +34,17 @@
   .btn-add { flex: none; padding: 10px 16px; border: none; border-radius: 10px; background: var(--ink); color: #fff; font-size: 14px; font-weight: 600; }
   .btn-add:hover { background: #464037; }
   .btn-closed {
-    flex: none; margin-left: auto; display: flex; align-items: center; gap: 8px; padding: 9px 14px;
+    flex: none; display: flex; align-items: center; gap: 8px; padding: 9px 14px;
     border: 1px solid var(--line); border-radius: 10px; background: #fff; color: #46403a; font-size: 14px; font-weight: 600;
   }
   .btn-closed:hover { background: #F4F1EA; }
+  #toggleDrawer { margin-left: auto; }
   .badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: #B6E2A1; color: #2f4a24; font-size: 12px; font-weight: 700; }
+  .sync { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: #9b938a; white-space: nowrap; }
+  .sync .dotind { width: 8px; height: 8px; border-radius: 50%; background: #c2bcb2; }
+  .sync.cloud { color: #2f6a3a; } .sync.cloud .dotind { background: #57a86a; }
+  .sync.local .dotind { background: #c8a13a; }
+  .sync.err { color: #9e4136; } .sync.err .dotind { background: #c0584c; }
 
   #board { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #E4DED2; touch-action: none; }
   #world {
@@ -81,6 +87,9 @@
   .zb { width: 32px; font-size: 19px; } #zpct { min-width: 54px; font-size: 13px; font-weight: 600; } .zhome { width: 32px; font-size: 15px; }
   .sep { width: 1px; height: 20px; background: var(--line); margin: 0 2px; }
 
+  #toast { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(20px); background: var(--ink); color: #fff; padding: 9px 16px; border-radius: 10px; font-size: 13.5px; font-weight: 600; box-shadow: 0 6px 18px rgba(0,0,0,.22); opacity: 0; pointer-events: none; transition: opacity .2s ease, transform .2s ease; z-index: 90; }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
   #drawer {
     position: absolute; top: 0; right: 0; height: 100%; width: 330px; max-width: 86%;
     background: var(--chrome); border-left: 1px solid var(--line); box-shadow: -10px 0 30px rgba(0,0,0,.10);
@@ -113,6 +122,8 @@
       <input id="quick" placeholder="Escribe una tarea y pulsa Enter…" autocomplete="off" />
       <button class="btn-add" id="addBtn">Añadir</button>
     </div>
+    <span class="sync" id="syncStatus" title="Estado de sincronización"><span class="dotind"></span><span id="syncText">…</span></span>
+    <button class="btn-closed" id="shareBtn" title="Copiar el enlace de este tablero para abrirlo en otros dispositivos">Compartir</button>
     <button class="btn-closed" id="toggleDrawer"><span>Cerradas</span><span class="badge" id="doneCount">0</span></button>
   </header>
 
@@ -128,6 +139,8 @@
       <button class="zhome" id="zHome" title="Centrar / inicio">⌂</button>
     </div>
 
+    <div id="toast"></div>
+
     <aside id="drawer">
       <div class="dhead">
         <div><h2 style="display:inline">Tareas cerradas</h2><span class="cnt" id="doneCount2">0</span></div>
@@ -141,11 +154,15 @@
   </main>
 </div>
 
+<!-- Cliente de Supabase (sincronización en la nube). Si no carga, la app sigue funcionando en local. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<!-- Tus credenciales de Supabase (rellena config.js). -->
+<script src="config.js"></script>
 <script>
 (function () {
   "use strict";
   var WORLD_W = 4000, WORLD_H = 3000, Z_MIN = 0.4, Z_MAX = 2.5;
-  var KEY = "kanban_postits_v1", VKEY = "kanban_view_v1";
+  var KEY = "kanban_postits_v1", VKEY = "kanban_view_v1", BKEY = "kanban_board_id";
   var COLORS = ["#FCE181", "#F7B8C8", "#A9D6F2", "#B6E2A1", "#FBC98B", "#CDBDF2"];
 
   var board = document.getElementById("board");
@@ -156,6 +173,76 @@
   var notes = load();
   var view = loadView();
   var editingId = null;
+  var dragging = false;
+  var pendingRender = false;
+
+  // ---------- cloud (Supabase) ----------
+  var SB = null, cloudReady = false;
+  var boardId = getBoardId();
+  function hasConfig() { return !!(window.SUPABASE_URL && window.SUPABASE_ANON_KEY); }
+  function initCloud() {
+    if (!hasConfig()) { setSync("local", "Local"); return; }
+    if (!window.supabase || !window.supabase.createClient) { setSync("err", "Sin conexión"); return; }
+    try { SB = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); }
+    catch (e) { setSync("err", "Config inválida"); return; }
+    setSync("local", "Conectando…");
+    cloudLoad();
+  }
+  function rowToNote(r) { return { id: r.id, text: r.text || "", color: r.color, x: +r.x || 0, y: +r.y || 0, rot: +r.rot || 0, done: !!r.done }; }
+  function noteToRow(n) { return { id: n.id, board_id: boardId, text: n.text, color: n.color, x: n.x, y: n.y, rot: n.rot, done: n.done, updated_at: new Date().toISOString() }; }
+  function cloudLoad() {
+    SB.from("notes").select("*").eq("board_id", boardId).then(function (res) {
+      if (res.error) { setSync("err", "Error nube"); console.warn("Supabase load:", res.error.message); return; }
+      cloudReady = true;
+      notes = (res.data || []).map(rowToNote);
+      save(); render();
+      setSync("cloud", "Sincronizado");
+      subscribeRealtime();
+    }, function (err) { setSync("err", "Error nube"); console.warn(err); });
+  }
+  function cloudUpsert(n) { if (!SB) return; SB.from("notes").upsert(noteToRow(n)).then(function (r) { if (r.error) console.warn("upsert:", r.error.message); }); }
+  function cloudDelete(id) { if (!SB) return; SB.from("notes").delete().eq("id", id).eq("board_id", boardId).then(function (r) { if (r.error) console.warn("delete:", r.error.message); }); }
+  function subscribeRealtime() {
+    try {
+      SB.channel("notes-" + boardId)
+        .on("postgres_changes", { event: "*", schema: "public", table: "notes", filter: "board_id=eq." + boardId }, applyRemote)
+        .subscribe();
+    } catch (e) { console.warn("realtime:", e); }
+  }
+  function applyRemote(payload) {
+    if (payload.eventType === "DELETE") {
+      var did = payload.old && payload.old.id;
+      notes = notes.filter(function (x) { return x.id !== did; });
+    } else {
+      var n = rowToNote(payload.new), ex = byId(n.id);
+      if (ex) {
+        // No pisar el texto/posición de una nota que estoy editando en este dispositivo.
+        if (editingId === n.id) { ex.color = n.color; ex.done = n.done; }
+        else { ex.text = n.text; ex.color = n.color; ex.x = n.x; ex.y = n.y; ex.rot = n.rot; ex.done = n.done; }
+      } else { notes.push(n); }
+    }
+    save(); renderSafe();
+  }
+
+  function getBoardId() {
+    var m = (location.hash || "").match(/board=([A-Za-z0-9_-]+)/);
+    if (m) { try { localStorage.setItem(BKEY, m[1]); } catch (e) {} return m[1]; }
+    var s = null; try { s = localStorage.getItem(BKEY); } catch (e) {}
+    if (!s) { s = "b" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); try { localStorage.setItem(BKEY, s); } catch (e) {} }
+    if ((location.hash || "").indexOf("board=") === -1) { try { history.replaceState(null, "", "#board=" + s); } catch (e) {} }
+    return s;
+  }
+  function setSync(cls, txt) {
+    var el = document.getElementById("syncStatus");
+    el.className = "sync " + cls;
+    document.getElementById("syncText").textContent = txt;
+  }
+  var toastT = null;
+  function toast(msg) {
+    var t = document.getElementById("toast");
+    t.textContent = msg; t.classList.add("show");
+    clearTimeout(toastT); toastT = setTimeout(function () { t.classList.remove("show"); }, 1900);
+  }
 
   function load() {
     try { var r = localStorage.getItem(KEY); if (r) { var a = JSON.parse(r); if (Array.isArray(a)) return a; } } catch (e) {}
@@ -192,7 +279,9 @@
   function zoomCentered(factor) { var r = board.getBoundingClientRect(); zoomAt(factor, r.width / 2, r.height / 2); }
 
   // ---------- render ----------
+  function renderSafe() { if (dragging || editingId) { pendingRender = true; } else { render(); } }
   function render() {
+    pendingRender = false;
     // active notes
     var active = notes.filter(function (n) { return !n.done; });
     var completed = notes.filter(function (n) { return n.done; });
@@ -236,12 +325,12 @@
       var d = document.createElement("button");
       d.className = "dot" + (hex === n.color ? " sel" : "");
       d.style.background = hex; d.title = "Cambiar color"; d.dataset.noDrag = "1";
-      d.addEventListener("click", function (ev) { ev.stopPropagation(); n.color = hex; save(); render(); });
+      d.addEventListener("click", function (ev) { ev.stopPropagation(); n.color = hex; save(); cloudUpsert(n); render(); });
       dots.appendChild(d);
     });
     var acts = document.createElement("div"); acts.className = "acts";
-    var doneB = mkIc("done", "✓", "Marcar como completada", function () { n.done = true; if (editingId === n.id) editingId = null; save(); render(); });
-    var delB = mkIc("del", "✕", "Eliminar", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); if (editingId === n.id) editingId = null; save(); render(); });
+    var doneB = mkIc("done", "✓", "Marcar como completada", function () { n.done = true; if (editingId === n.id) editingId = null; save(); cloudUpsert(n); render(); });
+    var delB = mkIc("del", "✕", "Eliminar", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); if (editingId === n.id) editingId = null; save(); cloudDelete(n.id); render(); });
     acts.appendChild(doneB); acts.appendChild(delB);
     tools.appendChild(dots); tools.appendChild(acts);
     inner.appendChild(tools);
@@ -278,9 +367,9 @@
     var tx = document.createElement("div"); tx.className = "ctext"; tx.textContent = n.text;
     var acts = document.createElement("div"); acts.className = "cacts";
     var r = document.createElement("button"); r.className = "cbtn"; r.textContent = "↩"; r.title = "Restaurar al tablero";
-    r.addEventListener("click", function () { n.done = false; save(); render(); });
+    r.addEventListener("click", function () { n.done = false; save(); cloudUpsert(n); render(); });
     var d = document.createElement("button"); d.className = "cbtn del"; d.textContent = "✕"; d.title = "Eliminar";
-    d.addEventListener("click", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); save(); render(); });
+    d.addEventListener("click", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); save(); cloudDelete(n.id); render(); });
     acts.appendChild(r); acts.appendChild(d);
     row.appendChild(sw); row.appendChild(tx); row.appendChild(acts);
     return row;
@@ -288,15 +377,15 @@
 
   function commitEdit(id, val) {
     var t = (val || "").trim();
-    if (!t) notes = notes.filter(function (x) { return x.id !== id; });
-    else { var n = byId(id); if (n) n.text = t; }
+    if (!t) { notes = notes.filter(function (x) { return x.id !== id; }); cloudDelete(id); }
+    else { var n = byId(id); if (n) { n.text = t; cloudUpsert(n); } }
     editingId = null; save(); render();
   }
 
   // ---------- create ----------
   function addNote(text, x, y, edit) {
     var n = { id: uid(), text: text, color: COLORS[notes.length % COLORS.length], x: x, y: y, rot: Math.round((Math.random() * 7 - 3.5) * 10) / 10, done: false };
-    notes.push(n); if (edit) editingId = n.id; save(); render();
+    notes.push(n); if (edit) editingId = n.id; save(); if (text) cloudUpsert(n); render();
   }
   function spawn(text) {
     var r = board.getBoundingClientRect();
@@ -315,7 +404,7 @@
     el.style.zIndex = 200; el.style.cursor = "grabbing"; document.body.style.userSelect = "none";
     function move(ev) {
       var dx = (ev.clientX - sx) / z, dy = (ev.clientY - sy) / z;
-      if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+      if (Math.abs(dx) + Math.abs(dy) > 3) { moved = true; dragging = true; }
       if (moved) el.style.transform = "translate(" + dx + "px," + dy + "px)";
     }
     function up(ev) {
@@ -328,7 +417,9 @@
         var ny = clamp(oy + (ev.clientY - sy) / z, 0, WORLD_H - 60);
         n.x = Math.round(nx); n.y = Math.round(ny);
         el.style.transform = ""; el.style.left = n.x + "px"; el.style.top = n.y + "px"; el.style.zIndex = "";
-        save();
+        save(); cloudUpsert(n);
+        dragging = false;
+        if (pendingRender) render();
       } else {
         el.style.zIndex = "";
         editingId = id; render();
@@ -384,10 +475,22 @@
   quick.addEventListener("keydown", function (e) { if (e.key === "Enter") quickAdd(); });
   document.getElementById("addBtn").addEventListener("click", quickAdd);
 
+  document.getElementById("shareBtn").addEventListener("click", function () {
+    var link = location.origin + location.pathname + "#board=" + boardId;
+    var done = function () { toast(hasConfig() ? "Enlace copiado · ábrelo en otros dispositivos" : "Enlace copiado (configura Supabase para sincronizar)"); };
+    if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(link).then(done, function () { window.prompt("Copia el enlace de tu tablero:", link); }); }
+    else { window.prompt("Copia el enlace de tu tablero:", link); }
+  });
+
   var drawer = document.getElementById("drawer");
   document.getElementById("toggleDrawer").addEventListener("click", function () { drawer.classList.toggle("open"); });
   document.getElementById("closeDrawer").addEventListener("click", function () { drawer.classList.remove("open"); });
-  document.getElementById("clearDone").addEventListener("click", function () { notes = notes.filter(function (n) { return !n.done; }); save(); render(); });
+  document.getElementById("clearDone").addEventListener("click", function () {
+    var removed = notes.filter(function (n) { return n.done; });
+    notes = notes.filter(function (n) { return !n.done; });
+    removed.forEach(function (n) { cloudDelete(n.id); });
+    save(); render();
+  });
 
   document.getElementById("zIn").addEventListener("click", function () { zoomCentered(1.2); });
   document.getElementById("zOut").addEventListener("click", function () { zoomCentered(1 / 1.2); });
@@ -397,7 +500,8 @@
   // ---------- init ----------
   applyView();
   render();
-  save(); saveView();
+  saveView();
+  initCloud();
 })();
 </script>
 </body>
