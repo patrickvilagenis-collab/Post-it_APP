@@ -162,7 +162,7 @@
 (function () {
   "use strict";
   var WORLD_W = 4000, WORLD_H = 3000, Z_MIN = 0.4, Z_MAX = 2.5;
-  var KEY = "kanban_postits_v1", VKEY = "kanban_view_v1", BKEY = "kanban_board_id";
+  var KEY = "kanban_postits_v1", VKEY = "kanban_view_v1", BKEY = "kanban_board_id", TKEY = "kanban_tombstones_v1";
   var COLORS = ["#FCE181", "#F7B8C8", "#A9D6F2", "#B6E2A1", "#FBC98B", "#CDBDF2"];
 
   var board = document.getElementById("board");
@@ -198,21 +198,32 @@
     toast("Nube: " + lastError);
     console.warn("[nube]", lastError);
   }
-  function rowToNote(r) { return { id: r.id, text: r.text || "", color: r.color, x: +r.x || 0, y: +r.y || 0, rot: +r.rot || 0, done: !!r.done }; }
-  function noteToRow(n) { return { id: n.id, board_id: boardId, text: n.text, color: n.color, x: n.x, y: n.y, rot: n.rot, done: n.done, updated_at: new Date().toISOString() }; }
+  function rowToNote(r) { return { id: r.id, text: r.text || "", color: r.color, x: +r.x || 0, y: +r.y || 0, rot: +r.rot || 0, done: !!r.done, up: Date.parse(r.updated_at) || 0 }; }
+  function noteToRow(n) { return { id: n.id, board_id: boardId, text: n.text, color: n.color, x: n.x, y: n.y, rot: n.rot, done: n.done, updated_at: new Date(n.up || Date.now()).toISOString() }; }
   function cloudLoad() {
     SB.from("notes").select("*").eq("board_id", boardId).then(function (res) {
       if (res.error) { cloudErr((res.error.message || "") + (res.error.hint ? " · " + res.error.hint : "")); return; }
-      cloudReady = true; lastError = null;
-      // Fusionar nube + local: nunca descartar notas locales que la nube no tiene.
-      // La nube manda en notas con el mismo id; las locales que falten se suben.
+      cloudReady = true; lastError = null; lastPull = Date.now();
+      // Fusionar nube + local sin perder nada: por cada nota gana la versión
+      // más reciente (updated_at); las borradas aquí (lápidas) no resucitan.
       var remote = (res.data || []).map(rowToNote);
-      var have = {};
-      remote.forEach(function (r) { have[r.id] = true; });
-      var localOnly = notes.filter(function (n) { return !have[n.id]; });
-      notes = remote.concat(localOnly);
-      localOnly.forEach(function (n) { if (!isPristineSeed(n)) cloudUpsert(n); });
-      save(); render();
+      var localById = {};
+      notes.forEach(function (n) { localById[n.id] = n; });
+      var merged = [], have = {};
+      remote.forEach(function (r) {
+        have[r.id] = true;
+        if (tombs[r.id] && tombs[r.id] > (r.up || 0)) { cloudDelete(r.id); return; }
+        var loc = localById[r.id];
+        if (loc && (loc.up || 0) > (r.up || 0)) { merged.push(loc); cloudUpsert(loc); }
+        else { merged.push(r); }
+      });
+      notes.forEach(function (n) {
+        if (have[n.id]) return;
+        merged.push(n);
+        if (!isPristineSeed(n)) cloudUpsert(n);
+      });
+      notes = merged;
+      save(); renderSafe();
       setSync("cloud", "Sincronizado");
       document.getElementById("syncStatus").title = "Sincronizado con la nube";
       subscribeRealtime();
@@ -220,11 +231,14 @@
   }
   function cloudUpsert(n) { if (!SB) return; SB.from("notes").upsert(noteToRow(n)).then(function (r) { if (r.error) console.warn("upsert:", r.error.message); }); }
   function cloudDelete(id) { if (!SB) return; SB.from("notes").delete().eq("id", id).eq("board_id", boardId).then(function (r) { if (r.error) console.warn("delete:", r.error.message); }); }
+  var rtSubscribed = false;
   function subscribeRealtime() {
+    if (rtSubscribed) return;
     try {
       SB.channel("notes-" + boardId)
         .on("postgres_changes", { event: "*", schema: "public", table: "notes", filter: "board_id=eq." + boardId }, applyRemote)
         .subscribe();
+      rtSubscribed = true;
     } catch (e) { console.warn("realtime:", e); }
   }
   function applyRemote(payload) {
@@ -233,14 +247,26 @@
       notes = notes.filter(function (x) { return x.id !== did; });
     } else {
       var n = rowToNote(payload.new), ex = byId(n.id);
+      if (tombs[n.id] && tombs[n.id] > (n.up || 0)) { cloudDelete(n.id); return; }
       if (ex) {
-        // No pisar el texto/posición de una nota que estoy editando en este dispositivo.
+        // No pisar una versión local más nueva ni la nota que se está editando.
+        if ((ex.up || 0) > (n.up || 0)) return;
         if (editingId === n.id) { ex.color = n.color; ex.done = n.done; }
-        else { ex.text = n.text; ex.color = n.color; ex.x = n.x; ex.y = n.y; ex.rot = n.rot; ex.done = n.done; }
+        else { ex.text = n.text; ex.color = n.color; ex.x = n.x; ex.y = n.y; ex.rot = n.rot; ex.done = n.done; ex.up = n.up; }
       } else { notes.push(n); }
     }
     save(); renderSafe();
   }
+  // Refrescar desde la nube al volver a la pestaña/app o recuperar conexión.
+  var lastPull = 0;
+  function repull() {
+    if (!SB || !cloudReady) return;
+    if (Date.now() - lastPull < 8000) return;
+    cloudLoad();
+  }
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) repull(); });
+  window.addEventListener("focus", repull);
+  window.addEventListener("online", function () { if (SB) { setSync("local", "Reconectando…"); cloudLoad(); } });
 
   function getBoardId() {
     var m = (location.hash || "").match(/board=([A-Za-z0-9_-]+)/);
@@ -288,6 +314,26 @@
   }
   function save() { try { localStorage.setItem(KEY, JSON.stringify(notes)); } catch (e) {} }
   function saveView() { try { localStorage.setItem(VKEY, JSON.stringify(view)); } catch (e) {} }
+
+  // Lápidas: ids borrados aquí, con fecha, para que no resuciten al fusionar.
+  var tombs = loadTombs();
+  function loadTombs() {
+    try { var r = localStorage.getItem(TKEY); if (r) { var o = JSON.parse(r); if (o && typeof o === "object" && !Array.isArray(o)) return o; } } catch (e) {}
+    return {};
+  }
+  function saveTombs() {
+    try {
+      var ids = Object.keys(tombs);
+      if (ids.length > 300) {
+        ids.sort(function (a, b) { return tombs[a] - tombs[b]; });
+        ids.slice(0, ids.length - 300).forEach(function (id) { delete tombs[id]; });
+      }
+      localStorage.setItem(TKEY, JSON.stringify(tombs));
+    } catch (e) {}
+  }
+  function bury(id) { tombs[id] = Date.now(); saveTombs(); }
+  // Marca una nota como modificada ahora (para que gane en la fusión).
+  function touch(n) { n.up = Date.now(); }
 
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
   function uid() { return "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5); }
@@ -351,12 +397,12 @@
       var d = document.createElement("button");
       d.className = "dot" + (hex === n.color ? " sel" : "");
       d.style.background = hex; d.title = "Cambiar color"; d.dataset.noDrag = "1";
-      d.addEventListener("click", function (ev) { ev.stopPropagation(); n.color = hex; save(); cloudUpsert(n); render(); });
+      d.addEventListener("click", function (ev) { ev.stopPropagation(); n.color = hex; touch(n); save(); cloudUpsert(n); render(); });
       dots.appendChild(d);
     });
     var acts = document.createElement("div"); acts.className = "acts";
-    var doneB = mkIc("done", "✓", "Marcar como completada", function () { n.done = true; if (editingId === n.id) editingId = null; save(); cloudUpsert(n); render(); });
-    var delB = mkIc("del", "✕", "Eliminar", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); if (editingId === n.id) editingId = null; save(); cloudDelete(n.id); render(); });
+    var doneB = mkIc("done", "✓", "Marcar como completada", function () { n.done = true; touch(n); if (editingId === n.id) editingId = null; save(); cloudUpsert(n); render(); });
+    var delB = mkIc("del", "✕", "Eliminar", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); bury(n.id); if (editingId === n.id) editingId = null; save(); cloudDelete(n.id); render(); });
     acts.appendChild(doneB); acts.appendChild(delB);
     tools.appendChild(dots); tools.appendChild(acts);
     inner.appendChild(tools);
@@ -393,9 +439,9 @@
     var tx = document.createElement("div"); tx.className = "ctext"; tx.textContent = n.text;
     var acts = document.createElement("div"); acts.className = "cacts";
     var r = document.createElement("button"); r.className = "cbtn"; r.textContent = "↩"; r.title = "Restaurar al tablero";
-    r.addEventListener("click", function () { n.done = false; save(); cloudUpsert(n); render(); });
+    r.addEventListener("click", function () { n.done = false; touch(n); save(); cloudUpsert(n); render(); });
     var d = document.createElement("button"); d.className = "cbtn del"; d.textContent = "✕"; d.title = "Eliminar";
-    d.addEventListener("click", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); save(); cloudDelete(n.id); render(); });
+    d.addEventListener("click", function () { notes = notes.filter(function (x) { return x.id !== n.id; }); bury(n.id); save(); cloudDelete(n.id); render(); });
     acts.appendChild(r); acts.appendChild(d);
     row.appendChild(sw); row.appendChild(tx); row.appendChild(acts);
     return row;
@@ -403,14 +449,14 @@
 
   function commitEdit(id, val) {
     var t = (val || "").trim();
-    if (!t) { notes = notes.filter(function (x) { return x.id !== id; }); cloudDelete(id); }
-    else { var n = byId(id); if (n) { n.text = t; cloudUpsert(n); } }
+    if (!t) { notes = notes.filter(function (x) { return x.id !== id; }); bury(id); cloudDelete(id); }
+    else { var n = byId(id); if (n) { n.text = t; touch(n); cloudUpsert(n); } }
     editingId = null; save(); render();
   }
 
   // ---------- create ----------
   function addNote(text, x, y, edit) {
-    var n = { id: uid(), text: text, color: COLORS[notes.length % COLORS.length], x: x, y: y, rot: Math.round((Math.random() * 7 - 3.5) * 10) / 10, done: false };
+    var n = { id: uid(), text: text, color: COLORS[notes.length % COLORS.length], x: x, y: y, rot: Math.round((Math.random() * 7 - 3.5) * 10) / 10, done: false, up: Date.now() };
     notes.push(n); if (edit) editingId = n.id; save(); if (text) cloudUpsert(n); render();
   }
   function spawn(text) {
@@ -441,7 +487,7 @@
       if (moved) {
         var nx = clamp(ox + (ev.clientX - sx) / z, 0, WORLD_W - 200);
         var ny = clamp(oy + (ev.clientY - sy) / z, 0, WORLD_H - 60);
-        n.x = Math.round(nx); n.y = Math.round(ny);
+        n.x = Math.round(nx); n.y = Math.round(ny); touch(n);
         el.style.transform = ""; el.style.left = n.x + "px"; el.style.top = n.y + "px"; el.style.zIndex = "";
         save(); cloudUpsert(n);
         dragging = false;
@@ -521,7 +567,7 @@
   document.getElementById("clearDone").addEventListener("click", function () {
     var removed = notes.filter(function (n) { return n.done; });
     notes = notes.filter(function (n) { return !n.done; });
-    removed.forEach(function (n) { cloudDelete(n.id); });
+    removed.forEach(function (n) { bury(n.id); cloudDelete(n.id); });
     save(); render();
   });
 
