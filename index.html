@@ -204,7 +204,14 @@
     SB.from("notes").select("*").eq("board_id", boardId).then(function (res) {
       if (res.error) { cloudErr((res.error.message || "") + (res.error.hint ? " · " + res.error.hint : "")); return; }
       cloudReady = true; lastError = null;
-      notes = (res.data || []).map(rowToNote);
+      // Fusionar nube + local: nunca descartar notas locales que la nube no tiene.
+      // La nube manda en notas con el mismo id; las locales que falten se suben.
+      var remote = (res.data || []).map(rowToNote);
+      var have = {};
+      remote.forEach(function (r) { have[r.id] = true; });
+      var localOnly = notes.filter(function (n) { return !have[n.id]; });
+      notes = remote.concat(localOnly);
+      localOnly.forEach(function (n) { if (!isPristineSeed(n)) cloudUpsert(n); });
       save(); render();
       setSync("cloud", "Sincronizado");
       document.getElementById("syncStatus").title = "Sincronizado con la nube";
@@ -259,14 +266,22 @@
     try { var r = localStorage.getItem(KEY); if (r) { var a = JSON.parse(r); if (Array.isArray(a)) return a; } } catch (e) {}
     return seed();
   }
+  var SEED_TEXTS = {
+    s1: "¡Hola! Doble clic en el tablero para crear una nota nueva",
+    s2: "Arrástrame para moverme · clic para editar",
+    s3: "Cambia mi color para agrupar ideas por proximidad",
+    s4: "Tarea de ejemplo ya completada"
+  };
   function seed() {
     return [
-      { id: "s1", text: "¡Hola! Doble clic en el tablero para crear una nota nueva", color: "#FCE181", x: 60, y: 70, rot: -3, done: false },
-      { id: "s2", text: "Arrástrame para moverme · clic para editar", color: "#F7B8C8", x: 340, y: 150, rot: 2.5, done: false },
-      { id: "s3", text: "Cambia mi color para agrupar ideas por proximidad", color: "#A9D6F2", x: 150, y: 330, rot: -1.5, done: false },
-      { id: "s4", text: "Tarea de ejemplo ya completada", color: "#B6E2A1", x: 0, y: 0, rot: 0, done: true }
+      { id: "s1", text: SEED_TEXTS.s1, color: "#FCE181", x: 60, y: 70, rot: -3, done: false },
+      { id: "s2", text: SEED_TEXTS.s2, color: "#F7B8C8", x: 340, y: 150, rot: 2.5, done: false },
+      { id: "s3", text: SEED_TEXTS.s3, color: "#A9D6F2", x: 150, y: 330, rot: -1.5, done: false },
+      { id: "s4", text: SEED_TEXTS.s4, color: "#B6E2A1", x: 0, y: 0, rot: 0, done: true }
     ];
   }
+  // Nota de demostración sin modificar por el usuario (no se sube a la nube).
+  function isPristineSeed(n) { return SEED_TEXTS.hasOwnProperty(n.id) && n.text === SEED_TEXTS[n.id]; }
   function loadView() {
     try { var r = localStorage.getItem(VKEY); if (r) { var v = JSON.parse(r); if (v && typeof v.zoom === "number") return { panX: v.panX || 0, panY: v.panY || 0, zoom: clamp(v.zoom, Z_MIN, Z_MAX) }; } } catch (e) {}
     return { panX: 40, panY: 30, zoom: 1 };
