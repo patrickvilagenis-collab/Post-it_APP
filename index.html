@@ -177,28 +177,39 @@
   var pendingRender = false;
 
   // ---------- cloud (Supabase) ----------
-  var SB = null, cloudReady = false;
+  var SB = null, cloudReady = false, lastError = null;
   var boardId = getBoardId();
   function hasConfig() { return !!(window.SUPABASE_URL && window.SUPABASE_ANON_KEY); }
   function initCloud() {
     if (!hasConfig()) { setSync("local", "Local"); return; }
-    if (!window.supabase || !window.supabase.createClient) { setSync("err", "Sin conexión"); return; }
-    try { SB = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); }
-    catch (e) { setSync("err", "Config inválida"); return; }
+    if (!window.supabase || !window.supabase.createClient) { cloudErr("No cargó la librería (¿bloqueada?)"); return; }
+    try {
+      SB = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
+        auth: { persistSession: false }
+      });
+    } catch (e) { cloudErr("Config inválida: " + (e && e.message)); return; }
     setSync("local", "Conectando…");
     cloudLoad();
+  }
+  function cloudErr(msg) {
+    lastError = msg || "error desconocido";
+    setSync("err", "Error nube");
+    document.getElementById("syncStatus").title = "Error de nube (pulsa para reintentar): " + lastError;
+    toast("Nube: " + lastError);
+    console.warn("[nube]", lastError);
   }
   function rowToNote(r) { return { id: r.id, text: r.text || "", color: r.color, x: +r.x || 0, y: +r.y || 0, rot: +r.rot || 0, done: !!r.done }; }
   function noteToRow(n) { return { id: n.id, board_id: boardId, text: n.text, color: n.color, x: n.x, y: n.y, rot: n.rot, done: n.done, updated_at: new Date().toISOString() }; }
   function cloudLoad() {
     SB.from("notes").select("*").eq("board_id", boardId).then(function (res) {
-      if (res.error) { setSync("err", "Error nube"); console.warn("Supabase load:", res.error.message); return; }
-      cloudReady = true;
+      if (res.error) { cloudErr((res.error.message || "") + (res.error.hint ? " · " + res.error.hint : "")); return; }
+      cloudReady = true; lastError = null;
       notes = (res.data || []).map(rowToNote);
       save(); render();
       setSync("cloud", "Sincronizado");
+      document.getElementById("syncStatus").title = "Sincronizado con la nube";
       subscribeRealtime();
-    }, function (err) { setSync("err", "Error nube"); console.warn(err); });
+    }, function (err) { cloudErr((err && (err.message || err.toString())) || "fallo de red / CORS"); });
   }
   function cloudUpsert(n) { if (!SB) return; SB.from("notes").upsert(noteToRow(n)).then(function (r) { if (r.error) console.warn("upsert:", r.error.message); }); }
   function cloudDelete(id) { if (!SB) return; SB.from("notes").delete().eq("id", id).eq("board_id", boardId).then(function (r) { if (r.error) console.warn("delete:", r.error.message); }); }
@@ -481,6 +492,13 @@
     if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(link).then(done, function () { window.prompt("Copia el enlace de tu tablero:", link); }); }
     else { window.prompt("Copia el enlace de tu tablero:", link); }
   });
+
+  document.getElementById("syncStatus").addEventListener("click", function () {
+    if (!SB) { initCloud(); return; }
+    if (lastError) { setSync("local", "Reintentando…"); cloudLoad(); }
+    else if (lastError === null && cloudReady) { toast("Sincronizado con la nube ☁"); }
+  });
+  document.getElementById("syncStatus").style.cursor = "pointer";
 
   var drawer = document.getElementById("drawer");
   document.getElementById("toggleDrawer").addEventListener("click", function () { drawer.classList.toggle("open"); });
